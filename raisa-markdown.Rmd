@@ -1,0 +1,170 @@
+---
+title: "Raisa"
+author: "Abanoub Aziz"
+date: "November 17, 2016"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+options( java.parameters = "-Xmx4g" )
+library(dplyr)
+library(knitr)
+library(RWeka)
+library(tidyr)
+library(ggplot2)
+library(rjson)
+library(caTools)
+library(ggmap)
+```
+
+```{r cache=TRUE}
+train.df <- read.csv('train.csv')
+test.df <-  read.csv('test.csv')
+metadata.df <- read.csv('metaData_taxistandsID_name_GPSlocation.csv')
+```
+
+#Data Exploratory
+Number of records in our train dataset
+```{r}
+train.df %>% nrow
+```
+
+Number of taxicabs that have been in the train dataset
+```{r}
+train.df$TAXI_ID %>% unique %>% length
+```
+
+Percentage of rows with missing GPS coordinates is very low so we can ignore them.
+```{r}
+(train.df %>% filter(MISSING_DATA == 'True') %>% nrow / train.df %>% nrow) * 100
+train.df <- train.df %>% filter(MISSING_DATA == 'False')
+
+train.df <- train.df %>% filter(POLYLINE!='[]')
+test.df <- test.df %>% filter(POLYLINE!='[]')
+```
+
+Number of days with type A (a normal day, workday or weekend)
+```{r}
+train.df %>% filter(DAY_TYPE == 'A') %>% nrow
+```
+Number of days with type B holiday or any other special day (i.e. extending holidays, floating holidays, etc.)
+```{r}
+train.df %>% filter(DAY_TYPE == 'B') %>% nrow
+```
+Number of days with type C (day before a type-B day)
+```{r}
+train.df %>% filter(DAY_TYPE == 'C') %>% nrow
+```
+
+It seems there is error as all the records are DAY_TYPE 'A' but this can be handled if we have the official calendar for Portgual. But for we ignore that colmun
+```{r}
+train.df <- subset(train.df, select = -DAY_TYPE)
+```
+
+Applying stratified sampling to create smaller training dataset
+```{r}
+split_rows = sample.split(train.df$CALL_TYPE, SplitRatio=0.2)
+train.df <- train.df[split_rows,]
+```
+
+
+
+```{r echo=FALSE}
+# Helper function to calculate distance between two points.
+haversineDistance=function(lat1,lon1,lat2,lon2)
+{
+	#returns the distance in km
+	REarth<-6371
+	lat<-abs(lat1-lat2)*pi/180
+	lon<-abs(lon1-lon2)*pi/180
+	lat1<-lat1*pi/180
+	lat2<-lat2*pi/180
+	a<-sin(lat/2)*sin(lat/2)+cos(lat1)*cos(lat2)*sin(lon/2)*sin(lon/2)
+	d<-2*atan2(sqrt(a),sqrt(1-a))
+	d<-REarth*d
+	return(d)
+}
+```
+
+#Feature Engineering  
+
+Change the unix timestamp to date
+```{r}
+train.df <- train.df %>% mutate(date = as.POSIXct(TIMESTAMP, origin="1970-01-01", tz ="WET"))
+test.df <- test.df %>% mutate(date = as.POSIXct(TIMESTAMP, origin="1970-01-01", tz ="WET"))
+```
+
+* Estimate time for a trip = number of points * 15 seconds.
+* Extract the starting point and ending point from the polyline.
+* Calculate the distance for the trip using haversineDistance.
+* Difference between longitude and lattiudae coordinates between the starting and ending point.
+* Calculate average speed for the trip.
+
+```{r}
+train.df$POLYLINE <- as.vector(train.df$POLYLINE)
+test.df$POLYLINE <- as.vector(test.df$POLYLINE)
+
+train.df <- train.df %>% rowwise() %>% mutate(points = length(fromJSON(POLYLINE)), start.lon = fromJSON(POLYLINE)[[1]][1], start.lat = fromJSON(POLYLINE)[[1]][2], end.lon = fromJSON(POLYLINE)[[points]][1], end.lat = fromJSON(POLYLINE)[[points]][2], dis = haversineDistance(start.lat, start.lon, end.lat, end.lon), time = points * 15, avg.speed = dis/time, lon.diff = end.lon - start.lon, lat.diff = end.lat - start.lat)
+
+test.df <- test.df %>% rowwise() %>% mutate(points = length(fromJSON(POLYLINE)), start.lon = fromJSON(POLYLINE)[[1]][1], start.lat = fromJSON(POLYLINE)[[1]][2], end.lon = fromJSON(POLYLINE)[[points]][1], end.lat = fromJSON(POLYLINE)[[points]][2], dis = haversineDistance(start.lat, start.lon, end.lat, end.lon), time_so_far = points * 15, avg.speed = dis/time_so_far, lon.diff = end.lon - start.lon, lat.diff = end.lat - start.lat )
+```
+
+```{r message=FALSE, warning=FALSE}
+porto_map_roadmap <- get_map(location = "porto", maptype = "roadmap", zoom = 14)
+ggmap(porto_map_roadmap, extent = "device") + geom_density2d(data = train.df, 
+    aes(x = start.lon, y = start.lat), size = 0.3) + stat_density2d(data = train.df, 
+    aes(x = start.lon, y = start.lat, fill = ..level.., alpha = ..level..), size = 0.01, bins = 16, geom = "polygon") + scale_fill_gradient(low = "green", high = "red") + scale_alpha(range = c(0, 0.3), guide = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE}
+porto_map_toner <- get_map(location = "porto", source = "stamen", maptype = "toner", zoom = 12)
+ggmap(porto_map_toner, extent = "device") + geom_segment(aes(x = start.lon, y = start.lat, xend = end.lon, yend = end.lat ), colour = "red", alpha = 0.3, size = 2, data = head(train.df, n= 150), arrow=arrow(length=unit(0.3,"cm")) )
+```
+
+#Evaluation models
+
+```{r}
+# Build models
+SMOreg <- make_Weka_classifier("weka/classifiers/functions/SMOreg")
+MLP <- make_Weka_classifier("weka/classifiers/functions/MultilayerPerceptron")
+
+# Helper function for local CV
+evaluateModel <- function(model){
+  kFoldModel <- evaluate_Weka_classifier(model, numFolds = 5, seed = 123)
+  kFoldModel$details
+}
+
+model <- MLP(time ~ start.lon + start.lat + end.lon + end.lat + dis + lat.diff +lon.diff+ CALL_TYPE, data = train.df)
+evaluateModel(model)
+model <- LinearRegression(time ~ start.lon + start.lat + end.lon + end.lat, data = train.df)
+evaluateModel(model)
+```
+
+10-fold Cross Validation from the Azure ML 
+```{r}
+crossValidation <- read.csv('azureCV.csv')
+crossValidation$Model <- gsub("Microsoft.Analytics.MachineLearning.Local.BatchLinearRegressor", "Decision Trees", crossValidation$Model)
+crossValidation <- read.csv('azureCV.csv')
+crossValidation$Model <- gsub("Microsoft.Analytics.Modules.Gemini.Dll.GeminiDecisionForestRegressor", "Decision Trees", crossValidation$Model)
+crossValidation$Model <- gsub("Microsoft.Analytics.MachineLearning.Local.BayesianLinearRegressor", "BayesianLinearRegressor", crossValidation$Model)
+crossValidation$Model <- gsub("Microsoft.Analytics.MachineLearning.Local.BatchLinearRegressor", "LinearRegressor", crossValidation$Model)
+
+summary <- crossValidation %>% group_by(Model) %>% summarise(Mean.Absolute.Error = mean(Mean.Absolute.Error), Root.Mean.Squared.Error = mean(Root.Mean.Squared.Error),Relative.Absolute.Error = mean(Relative.Absolute.Error), Relative.Squared.Error = mean(Relative.Squared.Error))
+summary %>% kable
+
+ggplot(summary, aes(Model)) +
+  geom_point(aes(y = Mean.Absolute.Error, colour ='Mean.Absolute.Error'), size=1.5, group = 1, shape=1) + geom_point(aes(y = Root.Mean.Squared.Error, colour = 'Root.Mean.Squared.Error'), size= 1.5, group = 1, shape=2)+ geom_point(aes(y = Relative.Absolute.Error, colour = 'Relative.Absolute.Error'), size= 1.5, group = 1, shape=3)+ geom_point(aes(y = Relative.Squared.Error, colour = 'Relative.Squared.Error'), size= 1.5, group = 1, shape=4)+ 
+  xlab("Model Name")+ylab("Results")  +
+  scale_colour_manual(values=c("#F57670","#C680FC","GREEN","BLUE"))+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+myTarget = predict(model, newdata = test.df)
+myResult <- data.frame(TRIP_ID=test.df$TRIP_ID, TRAVEL_TIME=myTarget, time = test.df$time_so_far)
+myResult <- myResult %>% rowwise() %>% mutate(TRAVEL_TIME = max(TRAVEL_TIME,time))
+myResult$time <- NULL
+#write.table(myResult, file="Submissions/result35.csv", sep =",", row.names= FALSE)
+```
+
+#Conclusion
