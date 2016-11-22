@@ -4,6 +4,7 @@ author: "Abanoub Aziz"
 date: "November 17, 2016"
 output: html_document
 ---
+[kaggle contest link](https://www.kaggle.com/c/pkdd-15-predict-taxi-service-trajectory-i)
 
 ```{r message=FALSE, warning=FALSE}
 options( java.parameters = "-Xmx4g" )
