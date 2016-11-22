@@ -167,5 +167,3 @@ myResult <- myResult %>% rowwise() %>% mutate(TRAVEL_TIME = max(TRAVEL_TIME,time
 myResult$time <- NULL
 #write.table(myResult, file="Submissions/result35.csv", sep =",", row.names= FALSE)
 ```
-
-#Conclusion
